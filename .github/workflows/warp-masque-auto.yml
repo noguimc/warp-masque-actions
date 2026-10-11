@@ -1,0 +1,132 @@
+name: 生成 WARP MASQUE 配置（自动更新）
+
+# 每月自动跑一次，生成纯 WARP MASQUE 的 mihomo 配置，并把结果提交回仓库，
+# 得到一个固定的项目内订阅地址：
+#   https://raw.githubusercontent.com/<owner>/<repo>/<默认分支>/configs/warp-masque.yaml
+# 每次运行都会生成全新密钥并覆盖 configs/warp-masque.yaml，客户端订阅这个地址即可。
+#
+# 说明：标准 cron 表达不了"精确每 30 天"（日期字段写 */30 只会命中每月 1 号和 31 号，
+# 不均匀），所以取每月 1 号，约等于每 30 天一次。
+#
+# 每次都是全新 WARP 账号（不复用旧设备）：一个月一次频率很低，不会触发风控，
+# 顺便完成密钥轮换。
+
+on:
+  schedule:
+    - cron: '0 4 1 * *'   # 每月 1 号 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      device_name:
+        description: 设备名（WARP 后台显示用）
+        required: false
+        default: gh-actions
+      retention_days:
+        description: artifact 保留天数
+        required: false
+        default: '30'
+
+permissions:
+  contents: write
+
+# 同一时间只跑一个，避免并发提交打架
+concurrency:
+  group: warp-masque-auto
+  cancel-in-progress: false
+
+env:
+  # 提交到仓库里的固定路径，同时也是固定订阅地址的路径部分
+  OUT_FILE: configs/warp-masque.yaml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 下载 usque
+        run: |
+          set -euo pipefail
+          VER=$(curl -sL https://api.github.com/repos/Diniboy1123/usque/releases/latest \
+                | jq -r '.tag_name' | sed 's/^v//')
+          echo "usque 版本 $VER"
+          curl -sL -o usque.zip \
+            "https://github.com/Diniboy1123/usque/releases/download/v${VER}/usque_${VER}_linux_amd64.zip"
+          unzip -oq usque.zip
+          chmod +x usque
+          # 没有 config.json 时 usque version 会先打一条 error，不影响结果
+          ./usque version 2>/dev/null | grep -i version || true
+
+      - name: 注册设备并生成密钥
+        run: |
+          set -euo pipefail
+          ./usque register -a -n "${{ github.event.inputs.device_name || 'gh-actions' }}"
+          test -s config.json
+          # 只打印非敏感字段，密钥不进日志
+          python3 - <<'PY'
+          import json
+          c = json.load(open("config.json"))
+          print("endpoint_v4 =", c["endpoint_v4"])
+          print("endpoint_v6 =", c["endpoint_v6"])
+          print("内网地址 =", c["ipv4"], "/", c["ipv6"])
+          PY
+
+      - name: 生成 mihomo 配置
+        run: python3 scripts/gen_masque.py config.json dist
+
+      - name: 校验配置可加载
+        run: |
+          set -euo pipefail
+          URL=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases \
+                | grep -o 'https://[^"]*mihomo-linux-amd64-alpha[^"]*\.gz' | head -1)
+          curl -sL -o mihomo.gz "$URL"
+          gunzip -f mihomo.gz
+          chmod +x mihomo
+          mkdir -p check
+          cp dist/warp-masque.yaml check/config.yaml
+          # -t 只做配置解析校验，不起服务
+          ./mihomo -t -d check
+          echo "配置校验通过"
+
+      - name: 打包凭据与配置
+        run: |
+          cp config.json dist/usque-config.json
+          test -s dist/warp-masque.yaml
+          test -s dist/warp-masque-shadowrocket.txt
+          ls -l dist
+
+      - name: 提交回仓库（固定订阅地址）
+        run: |
+          set -euo pipefail
+          mkdir -p configs
+          cp dist/warp-masque.yaml "$OUT_FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OUT_FILE"
+          # 每次都是全新账号，内容通常会变；真没变就不提交
+          git diff --staged --quiet && { echo "内容无变化，跳过提交"; exit 0; }
+          git commit -m "自动更新: WARP MASQUE 配置 ($(date -u '+%F %T') UTC)"
+          git push
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: warp-masque-config
+          path: dist/
+          retention-days: ${{ github.event.inputs.retention_days || 30 }}
+          if-no-files-found: error
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo '## WARP MASQUE 配置已更新'
+            echo
+            echo '固定订阅地址（项目内，客户端订阅这个）：'
+            echo
+            echo "    https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/${OUT_FILE}"
+            echo
+            echo '- 每月自动重建一次，每次都是全新 WARP 账号'
+            echo '- 需要 mihomo Alpha 内核，稳定版不认 masque'
+            echo '- private-key 等同账号凭据，公开仓库任何人都能下载'
+            echo '- raw 链接有 CDN 缓存，刚更新后可能要等一两分钟才生效'
+          } >> "$GITHUB_STEP_SUMMARY"
